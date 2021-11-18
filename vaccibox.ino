@@ -1,139 +1,170 @@
+#include <NMEAGPS.h>  //parsing the comma seperated values to be more human readable
+#include <stdlib.h>   //the lib is needed for the floatToString() helper function
+#include <NeoSWSerial.h>  //it is used instead of SoftwareSerial
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <TinyGPS++.h>
-#include <SoftwareSerial.h>
 #include <Arduino_JSON.h>
-#include "SIM800L.h"
-#include <EEPROM.h>
 
 
-//gps
-const int gpsRxPin = 3;
-const int gpsTxPin = 4;
+//NOTE: THE CODE WILL ONLY WORK IF YOU HAVE ALREADY UNLOCKED YOUR SIM CARD - SO THE PHONE WON'T ASK FOR PIN CODE WHENEVER YOU USE IT
 
-int accuracy = 0;
-byte Y, M, D, H, MN, S;
 
-//gsm
-const int gsmRxPin = 8;
-const int gsmTxPin = 7;
-const int gsmRstPin = 6;
+//if there are more devices, the server must differentiate them by the deviceID
+int deviceId = 13;
 
-//status rgb
-const int R = 11;
-const int G = 12;
-const int B = A4;
-
-//buzzer
-//const int buzzer = 91;
-
-//led
-const int led = 9;
-
-//rollerSwitch
-const int rollerSwitch = A1;
-
-//relay
-const int relay = 10;
-
-//bat level
-const int batLevel = A5;
-
-//##configs##
+//SoftwareSerial variables
+static const int gpsRX = 4, gpsTX = 3;
+static const uint32_t gpsBaud = 9600;
+static const int simRX = 8, simTX = 7;
+static const uint32_t simBaud = 9600;
 
 //hardcoded boxid
-const char* boxId = "cc79a9b7";
+static const char* boxId = "cc79a9b7";
 
-//api
-const char apn[] = "";
-const char readingsUrl[] = "http://167.86.75.239:9123/api/v1/readings";
-const char settingsUrl[] = "http://167.86.75.239:9123/api/v1/settings";
-const char contentType[] = "application/json";
+//SoftwareSerial instances
+NeoSWSerial gpsPort(gpsRX, gpsTX);
+NeoSWSerial Sim800l(simRX, simTX);
 
-//settings
-int sendIntervalMs = 10000; //
-int lowTemp = 2;
-int highTemp = 10;
-int lowBattPercentage = 20;
+//GPS instance
+NMEAGPS gps;
+gps_fix fix;
 
-//ds18b20
+//for sending data to a remote webserver
+String ipAddress = "167.86.75.239:9123"; //this is the ip address of our server - e.g. "123.123.123.123"
+String APN = ""; //check your Internet provider's website for the APN e.g. "internet"
+
+//helper variables for waitUntilResponse() function
+String response = "";
+static long maxResponseTime = 10000;
+unsigned long lastTime;
+
+//The frequency of http requests (seconds)
+int refreshRate = 15; //SECONDS
+//variables for a well-scheduled loop - in which the sendData() gets called every 15 secs (refresh rate)
+unsigned long last;
+unsigned long current;
+unsigned long elapsed;
+
+//if there is an error in sendLocation() function after the GPRS Connection is setup - and the number of errors exceeds 3 - the system reboots. (with the help of the reboot pin) 
+int maxNumberOfErrors = 3;
+boolean gprsConnectionSetup = false;
+boolean reboot = false;
+int errorsEncountered = 0; //number of errors encountered after gprsConnection is set up - if exceeds the max number of errors the system reboots
+int resetPin = 12;
+
+int emptyGPSPass = 0;
+int maxEmptyGPSPass = 3;
+
+//if any error occurs with the gsm module or gps module, the corresponding LED will light up - until they don't get resolved
+int sim800Pin = 9; //error pin
+//int gpsPin = 6; //error pin
+
+
+//a helper function which converts a float to a string with a given precision
+String floatToString(float x, byte precision = 2) {
+  char tmp[50];
+  dtostrf(x, 0, precision, tmp);
+  return String(tmp);
+}
+
+//ds18b20 temperature module
 const int oneWireBus = 13;
 OneWire oneWire(oneWireBus);
 DallasTemperature tempSensor(&oneWire);
 
-//gps
-TinyGPSPlus gps;
-SoftwareSerial gpsSerial(gpsRxPin, gpsTxPin);
-//sim 800
-SIM800L* sim800l;
 
-//current eeprom address
-int addr = 0;
+void setup(){
 
-void setup()
-{
+  //setup resetPin
+  digitalWrite(resetPin, HIGH);
+  delay(200);
+  pinMode(resetPin, OUTPUT);
+  
+  //init
   Serial.begin(9600);
-  gpsSerial.begin(9600);
-  Serial.println("Initializing...");
-  pinMode(rollerSwitch, OUTPUT);
-  pinMode(relay, OUTPUT);
-  ///m pinMode(buzzer, OUTPUT);
-  ///m pinMode(R, OUTPUT);
-  ///m pinMode(G, OUTPUT);
-  ///m pinMode(B, OUTPUT);
-
-  pinMode(led, OUTPUT);
+  gpsPort.begin(gpsBaud);
+  Sim800l.begin(simBaud);
   
-  //initialise gsm software serial
-  SoftwareSerial* gsmSerial = new SoftwareSerial(gsmRxPin, gsmTxPin);
-  gsmSerial->begin(9600);
-  delay(1000);
-  // Initialize SIM800L driver with an internal buffer of 200 bytes and a reception buffer of 512 bytes, debug disabled
-  sim800l = new SIM800L((Stream *)gsmSerial, gsmRstPin, 100, 256, (Stream *)&Serial);
-  //setup gsm module
-  setupModule();
+  pinMode(sim800Pin, OUTPUT);
+  // pinMode(gpsPin, OUTPUT);
+  
+  Sim800l.write(27); //Clears buffer for safety
+  Serial.println("Beginning...");
+  delay(15000); //Waiting for Sim800L to get signal
+  Serial.println("SIM800L should have booted up");
+  
+  Sim800l.listen(); //The GSM module and GPS module can't communicate with the arduino board at once - so they need to get focus once we need them
+  setupGPRSConnection(); //Enable the internet connection to the SIM card
+  Serial.println("Connection set up");
+  
+  gpsPort.listen();
+
+  last = millis();
+  
 }
 
-void loop()
+void loop(){
+
+  current = millis();
+  elapsed += current - last;
+  last = current;
+
+  while (gps.available(gpsPort)) {
+      fix = gps.read();
+    }
+    
+   if(elapsed >= (refreshRate * 1000)) {
+    sendData();
+    elapsed -= (refreshRate * 1000);
+  }
+  //dumpData();
+
+  if ((gps.statistics.chars < 10)) {
+     //no gps detected (maybe wiring)
+     Serial.println("NO GPS DETECTED OR BEFORE FIRST HTTP REQUEST");
+  }
+
+  if(reboot){
+    // digitalWrite(resetPin, LOW);
+    digitalWrite(resetPin, LOW);   
+  }
+  
+}
+
+void dumpData()
 {
-
-  sim800l->setPowerMode(NORMAL);
-  getSettings();
-  
-  //get sensor readings and send
-  //int batVal = getBatLevel();
-  //int switchVal = getRollerState();
-  float tempVal = getcurrTemperature();
-  float latitude = getLat();
-  float longitude = getLon();
-  String timeStamp = getTimestamp();
-  
-  sendData(0,longitude,latitude,0,accuracy,timeStamp,tempVal);
-  
-  smartDelay(5000);
-
-  // delay(5000);
-
-  // sim800l->setPowerMode(SLEEP);
-
+    while(Sim800l.available())
+    {
+      char c = Sim800l.read();
+      Serial.print(c);
+    }  
 }
 
-// This custom version of delay() ensures that the tinyGPS object
-// is being "fed". From the TinyGPS++ examples.
-static void smartDelay(unsigned long ms)
-{
-  unsigned long start = millis();
-  do
-  {
-    // If data has come in from the GPS module
-    while (gpsSerial.available()) 
-      gps.encode(gpsSerial.read()); // Send it to the encode function
-    // tinyGPS.encode(char) continues to "load" the tinGPS object with new
-    // data coming in from the GPS module. As full NMEA strings begin to come in
-    // the tinyGPS library will be able to start parsing them for pertinent info
-  } while (millis() - start < ms);
-}
+void sendData(){
+ Serial.println("data to be sent");
+ String _temp = floatToString(getcurrTemperature());
+  if (fix.valid.location) {
+    //digitalWrite(gpsPin, LOW);
+    
+    String _lat = floatToString(fix.latitude(), 5);
+    String _lon = floatToString(fix.longitude(), 5);
+    String _timeStamp = getTimestamp();
 
+    Serial.println("Location fixed " + _lat + " " + _lon);
+    
+    sendData(_lat, _lon, _timeStamp, _temp);
+    emptyGPSPass = 0;
+    
+  } else {
+    sendData("-1", "-1","0", _temp);
+    emptyGPSPass++;
+  }
+
+  //if there are more errors or equal than previously set ==> reboot!
+  if (emptyGPSPass >= maxEmptyGPSPass){
+    reboot = true;
+  }
+}
 
 float getcurrTemperature() {
   tempSensor.requestTemperatures();
@@ -141,217 +172,154 @@ float getcurrTemperature() {
   return temperatureC;
 }
 
-int getRollerState() {
-  int state = digitalRead(rollerSwitch);
-  return state;
-}
-
-float getLat() {
-  if (gps.encode(gpsSerial.read())) {
-    if (gps.location.isValid())
-    {
-      accuracy = 1;
-      //dtostrf(gps.location.lat(), 10, 7, latitude);
-      float latitude = gps.location.lat();
-      return latitude;
-    }
-    else {
-      accuracy = 0;
-      float latitude = 0;
-      return latitude;
-    }
-  }
-}
-
-float getLon() {
-  if (gps.encode(gpsSerial.read())) {
-    if (gps.location.isValid())
-    {
-      accuracy = 1;
-      float longitude = gps.location.lng();
-      return longitude;
-    }
-    else {
-      accuracy = 0;
-      float longitude = 0;
-      return longitude;
-    }
-  }
-}
-
 String getTimestamp() {
-  if (gps.time.isValid())
+  byte Y, M, D, H, MN, S;
+  if (fix.valid.date) {
+    D = fix.dateTime.date; M = fix.dateTime.month; Y = fix.dateTime.year;
+  } else
   {
-    H = gps.time.hour();
-    MN = gps.time.minute();
-    S = gps.time.second();
+    Y = 0;  M = 0; D = 0;
+  }
+  
+  if (fix.valid.time)
+  {
+    H = fix.dateTime.hours;
+    
+    if (fix.dateTime.minutes < 10)
+      MN = '0' + fix.dateTime.minutes;
+    else
+      MN = fix.dateTime.minutes;
+
+    if (fix.dateTime.seconds < 10)
+      S = '0' + fix.dateTime.seconds;
+    else
+      S = fix.dateTime.seconds;
 
   }
   else {
-    H = "00";
-    MN = "00";
-    S = "00";
-
+    H = "00"; MN = "00"; S = "00";
   }
-  if (gps.date.isValid())
-  {
-    Y = gps.date.year();
-    M = gps.date.month();
-    D = gps.date.day();
-
-  }
-  else
-  {
-    Y = 0;
-    M = 0;
-    D = 0;
-  }
+ 
   //the full timestamp
-  String timeStamp = String(Y) + String(M) + String(D) + String(H) + String(MN) + String(S);
+  String timeStamp = String(Y) + '/' + String(M) + '/' + String(D) + ' ' + String(H) + ':' + String(MN) + ':' + String(S);
   return timeStamp;
 }
 
-void switchRelay(int state) {
-  digitalWrite(relay, state);
+void setupGPRSConnection(){
+  Sim800l.println("AT");
+  waitUntilResponse("OK");
+   Sim800l.println("AT+CSQ");
+  waitUntilResponse("OK");
+  Sim800l.println("AT+CCID");
+  waitUntilResponse("OK");
+  Sim800l.println("AT+CREG?");
+  waitUntilResponse("OK");
+ Sim800l.println("AT+SAPBR=3,1,\"Contype\",\"GPRS\""); //Connection type: GPRS
+ waitUntilResponse("OK");
+ Sim800l.println("AT+SAPBR=3,1,\"APN\",\"" + APN + "\""); //We need to set the APN which our internet provider gives us
+ waitUntilResponse("OK");
+ Sim800l.println("AT+SAPBR=1,1"); //Enable the GPRS
+ waitUntilResponse("OK");
+ Sim800l.println("AT+HTTPINIT"); //Enabling HTTP mode
+ waitUntilResponse("OK");
+ Sim800l.println("AT+HTTPPARA=\"CID\",1"); //Context ID to 1
+  waitUntilResponse("OK");
+ gprsConnectionSetup = true;
 }
 
-int getBatLevel() {
-  int maxVal = 800;
-  int level = analogRead(batLevel);
-  int batLevel = map(level, 0, maxVal, 0, 100);
-  return batLevel;
-}
-
-
-
-//void testBeep(int pulses) {
-//  for (int i = 0; i < pulses; i++) {
-//    tone(buzzer, 400, 500);
-//    noTone(buzzer);
-//  }
-//}
-
-void blink(int pulses, int interval) {
-  for ( int i =0; i < pulses; i++) {
-      digitalWrite(led, HIGH);   // turn the LED on (HIGH is the voltage level)
-      delay(interval);                       // wait for a second
-      digitalWrite(led, LOW);    // turn the LED off by making the voltage LOW
-      delay(interval);
+//ERROR handler - exits if error arises or a given time exceeds with no answer - or when everything is OK
+void waitUntilResponse(String resp){ 
+  lastTime = millis();
+  response="NULL";
+  String totalResponse = "NULL";
+  while(response.indexOf(resp) < 0 && millis() - lastTime < maxResponseTime)
+  { 
+    readResponse();
+    totalResponse = totalResponse + response;
+    Serial.println("Response: " + response);
   }
-      
-}
-
-
-
-void setupModule() {
-  // Wait until the module is ready to accept AT commands
-  while (!sim800l->isReady()) {
-    delay(1000);
-    blink(2, 200);
-  }
-
-  // Wait for the GSM signal
-  uint8_t signal = sim800l->getSignal();
-  while (signal <= 0) {
-    delay(1000);
-    signal = sim800l->getSignal();
-    blink(1, 200);
-  }
-  delay(1000);
-
-  // Wait for operator network registration (national or roaming network)
-  NetworkRegistration network = sim800l->getRegistrationStatus();
-  while (network != REGISTERED_HOME && network != REGISTERED_ROAMING) {
-    delay(1000);
-    network = sim800l->getRegistrationStatus();
-    blink(3, 200);
-  }
-  delay(1000);
-
-  // Setup APN for GPRS configuration
-  bool success = sim800l->setupGPRS(apn);
-  while (!success) {
-    success = sim800l->setupGPRS(apn);
-    delay(5000);
-    blink(4, 200);
-  }
-  Serial.println(F("GPRS config OK"));
-}
-
-
-void sendData(int batVal, float latitude,float longitude,int switchVal,int accuracy,String timeStamp,float tempVal) {
   
-  String data ="{\"box_id\":\"" + String(boxId) +"\",\"lat\":\""+String(latitude)+"\",\"long\":\""+String(longitude) + "\",\"accuracy\":\""+String(accuracy)+"\",\"timestamp\":\""+timeStamp+"\",\"temp\":\""+String(tempVal)+"\"}";
-  
-  const char* payload = data.c_str();
-
-  // Establish GPRS connectivity (5 trials)
-  bool connected = false;
-  for (uint8_t i = 0; i < 5 && !connected; i++) {
-    delay(1000);
-    connected = sim800l->connectGPRS();
+  if(totalResponse.length() <= 0)
+  { 
+    Serial.println("NO RESPONSE: " + totalResponse);
+    digitalWrite(sim800Pin, HIGH);
+    if (gprsConnectionSetup == true){
+      Serial.println("error");
+      errorsEncountered++;
+    }
+  }
+  else if (response.indexOf(resp) < 0)
+  { 
+    if (gprsConnectionSetup == true){
+      Serial.println("error");
+      errorsEncountered++;
+    }
+    Serial.println("UNEXPECTED RESPONSE: " + totalResponse);
+    digitalWrite(sim800Pin, HIGH);
+  }else{
+    Serial.println("SUCCESSFUL");
+    digitalWrite(sim800Pin, LOW);
+    errorsEncountered = 0;
   }
 
-  // Check if connected, if not reset the module and setup the config again
-  if (!connected) {
-    sim800l->reset();
-    setupModule();
-    return;
+  //if there are more errors or equal than previously set ==> reboot!
+  if (errorsEncountered>= maxNumberOfErrors){
+    reboot = true;
   }
-
-  Serial.println(payload);
-  // Do HTTP POST communication with 10s for the timeout (read and write)
-  uint16_t rc = sim800l->doPost(readingsUrl, contentType, payload, 10000, 10000);
-
-  // Close GPRS connectivity (5 trials)
-  connected = sim800l->disconnectGPRS();
-  for (uint8_t i = 0; i < 5 && !connected; i++) {
-    delay(1000);
-    connected = sim800l->disconnectGPRS();
-  }  
-
-  // End of program... wait...
-  // while (1);
 }
 
-void getSettings() {
-  // Establish GPRS connectivity (5 trials)
-  bool connected = false;
-  for (uint8_t i = 0; i < 5 && !connected; i++) {
-    delay(1000);
-    connected = sim800l->connectGPRS();
+//the function - which is responsible for sending data to the webserver
+void sendData(String lat, String lon, String timeStamp, String temp){
+
+  String sendtoserver ="{\"box_id\":\"" + String(boxId) +"\",\"lat\":\""+lat+"\",\"long\":\""+ lon + "\",\"accuracy\":\"0\",\"timestamp\":\""+timeStamp+"\",\"temp\":\""+ temp +"\"}";
+ 
+  Serial.println(sendtoserver);
+  
+  Sim800l.listen();
+  //The line below sets the URL we want to connect to
+  Sim800l.println("AT+HTTPPARA=\"URL\", \"http://" + ipAddress +  "/api/v1/readings\"");
+  waitUntilResponse("OK");
+
+  Sim800l.println("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+  waitUntilResponse("OK");
+
+  Sim800l.println("AT+HTTPDATA=" + String(sendtoserver.length()) + ",100000");
+  waitUntilResponse("OK");
+ 
+  Sim800l.println(sendtoserver);
+  waitUntilResponse("OK");
+
+ 
+  //GO
+  Sim800l.println("AT+HTTPACTION=1");
+  waitUntilResponse("OK");
+  waitUntilResponse("+HTTPACTION");
+  Sim800l.println("AT+HTTPREAD");
+  //waitUntilResponse("OK");
+  Sim800l.println("AT+HTTPTERM");
+  delay(5000);
+
+  Serial.println("Data sent");
+  gpsPort.listen();
+
+  reboot = true;
+}
+
+void readResponse(){
+  response = "";
+  while(response.length() <= 0 || !response.endsWith("\n"))
+  {
+    tryToRead();
+    if(millis() - lastTime > maxResponseTime)
+    {
+      return;
+    }
   }
+}
 
-
-  // Check if connected, if not reset the module and setup the config again
-  if (!connected) {
-    sim800l->reset();
-    setupModule();
-    return;
+void tryToRead(){ 
+  while(Sim800l.available()){
+    char c = Sim800l.read();  //gets one byte from serial buffer
+    response += c; //makes the string readString
   }
-
-  // Do HTTP GET communication with 10s for the timeout (read)
-  uint16_t rc = sim800l->doGet(settingsUrl, 10000);
-  if (rc == 200) {
-    // Success, store and output the data received on the serial
-    String settingsPayload = sim800l->getDataReceived();
-
-    JSONVar settingsObject = JSON.parse(settingsPayload);
-    //settings
-    JSONVar sendIntervalMs = settingsObject["temp_interval_ms"];
-    JSONVar highTemp = settingsObject["low_temp_celsius"];
-    JSONVar lowTemp = settingsObject["high_temp_celsius"];
-    JSONVar lowBattPercentage = settingsObject["low_batt_percentage"];
-
-  } else {
-    // Failed...
-    Serial.println(rc);
-  }
-  // Close GPRS connectivity (5 trials)
-  bool disconnected = sim800l->disconnectGPRS();
-  for(uint8_t i = 0; i < 5 && !disconnected; i++) {
-    delay(1000);
-    disconnected = sim800l->disconnectGPRS();
-  }
-
 }
